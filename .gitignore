@@ -1,218 +1,116 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[codz]
-*$py.class
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from flask_sqlalchemy import SQLAlchemy
+from anthropic import Anthropic
+from dotenv import load_dotenv
+from datetime import datetime
+import os
 
-# C extensions
-*.so
+load_dotenv()
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+app = Flask(__name__)
+CORS(app)
+app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL")
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-# PyInstaller
-#   Usually these files are written by a python script from a template
-#   before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+db = SQLAlchemy(app)
+client = Anthropic()
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+# ── Models ──────────────────────────────────────────
+class Conversation(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(200), default="New Conversation")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    messages = db.relationship("Message", backref="conversation", lazy=True, cascade="all, delete-orphan")
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py.cover
-.hypothesis/
-.pytest_cache/
-cover/
+class Message(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    conversation_id = db.Column(db.Integer, db.ForeignKey("conversation.id"), nullable=False)
+    role = db.Column(db.String(20), nullable=False)
+    content = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
-# Translations
-*.mo
-*.pot
+# ── System Prompt ────────────────────────────────────
+SYSTEM_PROMPT = """You are an Islamic scholar assistant with deep knowledge 
+of the Quran, Hadith, and classical Islamic scholarship.
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
+Rules:
+- Always cite Quran (Surah:Ayah) and Hadith (collection + number) when relevant
+- Mention when scholars differ on an issue
+- Note madhab differences (Hanafi, Maliki, Shafi'i, Hanbali) when relevant
+- Never give fatwas — recommend consulting a qualified scholar for personal rulings
+- Use appropriate Islamic phrases (ﷺ after the Prophet's name, رضي الله عنه for companions)
+- If unsure about something, say so — never fabricate citations
+- Be respectful, clear, and educational"""
 
-# Flask stuff:
-instance/
-.webassets-cache
+# ── Routes ───────────────────────────────────────────
 
-# Scrapy stuff:
-.scrapy
+# Get all conversations
+@app.route("/api/conversations", methods=["GET"])
+def get_conversations():
+    conversations = Conversation.query.order_by(Conversation.created_at.desc()).all()
+    return jsonify([{"id": c.id, "title": c.title, "created_at": c.created_at.isoformat()} for c in conversations])
 
-# Sphinx documentation
-docs/_build/
+# Create new conversation
+@app.route("/api/conversations", methods=["POST"])
+def create_conversation():
+    conv = Conversation(title="New Conversation")
+    db.session.add(conv)
+    db.session.commit()
+    return jsonify({"id": conv.id, "title": conv.title})
 
-# PyBuilder
-.pybuilder/
-target/
+# Delete conversation
+@app.route("/api/conversations/<int:conv_id>", methods=["DELETE"])
+def delete_conversation(conv_id):
+    conv = Conversation.query.get_or_404(conv_id)
+    db.session.delete(conv)
+    db.session.commit()
+    return jsonify({"success": True})
 
-# Jupyter Notebook
-.ipynb_checkpoints
+# Get messages for a conversation
+@app.route("/api/conversations/<int:conv_id>/messages", methods=["GET"])
+def get_messages(conv_id):
+    messages = Message.query.filter_by(conversation_id=conv_id).order_by(Message.created_at).all()
+    return jsonify([{"role": m.role, "content": m.content} for m in messages])
 
-# IPython
-profile_default/
-ipython_config.py
+# Send message
+@app.route("/api/conversations/<int:conv_id>/chat", methods=["POST"])
+def chat(conv_id):
+    conv = Conversation.query.get_or_404(conv_id)
+    data = request.json
+    user_content = data.get("message")
 
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
+    # Save user message
+    user_msg = Message(conversation_id=conv_id, role="user", content=user_content)
+    db.session.add(user_msg)
 
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-# Pipfile.lock
+    # Update conversation title from first message
+    if len(conv.messages) == 0:
+        conv.title = user_content[:60]
 
-# UV
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-# uv.lock
+    db.session.commit()
 
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-# poetry.lock
-# poetry.toml
+    # Build message history for Claude
+    history = [{"role": m.role, "content": m.content} for m in conv.messages]
 
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#   pdm recommends including project-wide configuration in pdm.toml, but excluding .pdm-python.
-#   https://pdm-project.org/en/latest/usage/project/#working-with-version-control
-# pdm.lock
-# pdm.toml
-.pdm-python
-.pdm-build/
+    # Get Claude response
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        system=SYSTEM_PROMPT,
+        messages=history
+    )
 
-# pixi
-#   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
-# pixi.lock
-#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
-#   in the .venv directory. It is recommended not to include this directory in version control.
-.pixi
+    reply = response.content[0].text
 
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
+    # Save assistant message
+    assistant_msg = Message(conversation_id=conv_id, role="assistant", content=reply)
+    db.session.add(assistant_msg)
+    db.session.commit()
 
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
+    return jsonify({"reply": reply})
 
-# Redis
-*.rdb
-*.aof
-*.pid
-
-# RabbitMQ
-mnesia/
-rabbitmq/
-rabbitmq-data/
-
-# ActiveMQ
-activemq-data/
-
-# SageMath parsed files
-*.sage.py
-
-# Environments
-.env
-.envrc
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Pyre type checker
-.pyre/
-
-# pytype static type analyzer
-.pytype/
-
-# Cython debug symbols
-cython_debug/
-
-# PyCharm
-#   JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#   be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#   and can be added to the global gitignore or merged into this file.  For a more nuclear
-#   option (not recommended) you can uncomment the following to ignore the entire idea folder.
-# .idea/
-
-# Abstra
-#   Abstra is an AI-powered process automation framework.
-#   Ignore directories containing user credentials, local state, and settings.
-#   Learn more at https://abstra.io/docs
-.abstra/
-
-# Visual Studio Code
-#   Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
-#   that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#   and can be added to the global gitignore or merged into this file. However, if you prefer, 
-#   you could uncomment the following to ignore the entire vscode folder
-# .vscode/
-# Temporary file for partial code execution
-tempCodeRunnerFile.py
-
-# Ruff stuff:
-.ruff_cache/
-
-# PyPI configuration file
-.pypirc
-
-# Marimo
-marimo/_static/
-marimo/_lsp/
-__marimo__/
-
-# Streamlit
-.streamlit/secrets.toml
+if __name__ == "__main__":
+    with app.app_context():
+        db.create_all()
+    app.run(debug=True, port=5000)
